@@ -14,6 +14,7 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <AiEsp32RotaryEncoder.h>
 #include <Arduino.h>
 #include "esp_bt.h"
 #include "esp_coexist.h"
@@ -23,7 +24,7 @@
 #include <freertos/semphr.h>
 
 // ------------------------ Board Info ----------------------------
-#define FIRMWARE_VERSION "1.2.1"
+#define FIRMWARE_VERSION "1.3.0"
 #define BOARD_NAME "LTS CB"
 
 // --------------------- Hardware Pin Defines ---------------------
@@ -64,6 +65,22 @@
 #define FAN_PIN 19        // was 13 (GPIO13 = SPI flash on C3, not usable)
 #define SERVO_PIN 8       // was 12 on S3; 20 not allowed - GPIO20 is UART0-TX
                           // (CH343 debug log pin), using it hijacks the console
+
+// ---------------- Rotary encoder (speed trim) -------------------
+// Speed knob: turn = change SPD%, fast spin = bigger jumps (acceleration).
+// The knob wins over BLE: for ENC_BLE_LOCKOUT_MS after a turn, incoming
+// "SPD" commands from the phone are ignored (stops the app's slider from
+// stomping the value you just dialled in), and every knob change is pushed
+// back over BLE so the app follows the hardware.
+#define ENC_A_PIN 0       // CLK  (GPIO0 free; 11/14-17 are flash pins!)
+#define ENC_B_PIN 18      // DT   (18/19 = native USB D-/D+, unused here:
+                          //       the console runs through the CH343 on 20/21)
+#define ENC_SW_PIN -1     // knob button: -1 = not wired (button on GPIO10)
+#define ENC_STEPS 4       // detents per count -- try 2 if one click adds 2
+#define ENC_ACCEL 90      // 0 = off; bigger = stronger "fast spin" boost
+#define ENC_MAX_JUMP 10   // cap: at most +/-10 % SPD per encoder event
+#define ENC_BLE_LOCKOUT_MS 2000
+#define ENC_NVS_SETTLE_MS 800    // write flash only after the knob settles
 
 // ------------------------ Motor Parameters ----------------------
 #define MICROSTEPPING 8
@@ -110,6 +127,8 @@ int calculatePWM(int brightnessPercent);
 void setConnLed(uint8_t duty);
 void setMotorCurrent(int percent);
 void handleCommand(const std::string& cmd);
+void applySpeedPercent(int pct);   // defined near the rotary-encoder section
+bool encoderHasPriority();
 
 // ------------------- Direct settings variables -------------------
 int speedPercent = 85;                        // 50-100
@@ -220,6 +239,17 @@ Adafruit_NeoPixel led(1, LED_PIN, NEO_GRB + NEO_KHZ800);
 Adafruit_SSD1306 oled(OLED_W, OLED_H, &Wire, -1, 400000);
 bool oledOk = false;
 uint8_t oledAddr = OLED_ADDR;   // runtime address (resolved by I2C scan)
+
+// ---- rotary encoder object + ISR (knob adjusts speedPercent) ----
+AiEsp32RotaryEncoder rotaryEncoder =
+    AiEsp32RotaryEncoder(ENC_A_PIN, ENC_B_PIN, ENC_SW_PIN, -1, ENC_STEPS);
+void IRAM_ATTR readEncoderISR() { rotaryEncoder.readEncoder_ISR(); }
+long lastEncoderValue = 0;
+unsigned long lastEncoderMoveMs = 0;      // for NVS settle + BLE lockout
+unsigned long lastEncNotifyMs = 0;
+bool encSpeedDirty = false;               // NVS write pending
+bool encNotifyPending = false;            // BLE push pending
+void pollRotaryEncoder();
 #else
 // No-op stub so the rest of the code compiles unchanged.
 struct NoLed {
@@ -975,16 +1005,18 @@ void handleCommand(const std::string& cmd) {
       changed = true;
     }
     if (set.containsKey("SPD")) {
-      int speed = constrain((int)set["SPD"], 50, 100);
-      double span = 170.0 - 93.0;
-      double baseInterval = 170.0 - ((double)(speed - 50) * span / 50.0);
-      baseTargetStepIntervalMicros = (unsigned long)lround(baseInterval);
-      speedPercent = speed;
-      prefs.begin("respooler", false);
-      prefs.putUInt("speed", baseTargetStepIntervalMicros);
-      prefs.end();
-      applySpeedTarget();
-      changed = true;
+      if (encoderHasPriority()) {
+        // Knob was just turned: ignore the app's slider for a moment so the
+        // hardware value wins. The phone still gets the knob value by notify.
+        Serial.println("[BLE] SPD ignored (encoder has priority)");
+      } else {
+        int speed = constrain((int)set["SPD"], 50, 100);
+        applySpeedPercent(speed);
+        prefs.begin("respooler", false);
+        prefs.putUInt("speed", baseTargetStepIntervalMicros);
+        prefs.end();
+        changed = true;
+      }
     }
     if (set.containsKey("HS")) {
       bool newHS = (int)set["HS"] != 0;
@@ -1165,6 +1197,15 @@ void setup() {
   pinMode(LED_CONN_PIN, OUTPUT);
   pinMode(FAN_PIN, OUTPUT);
   Serial.println("[BOOT] 2 gpio done");
+
+  // ---- rotary encoder (speed knob) -------------------------------
+  rotaryEncoder.begin();
+  rotaryEncoder.setup(readEncoderISR);          // ISR reads A/B transitions
+  rotaryEncoder.setBoundaries(-100000, 100000, false);  // no wrap-around
+  rotaryEncoder.setAcceleration(ENC_ACCEL);     // fast spin = bigger jumps
+  rotaryEncoder.setEncoderValue(0);
+  lastEncoderValue = 0;
+  Serial.println("[BOOT] 2c rotary encoder ok");
   // NOTE: OLED init moved to AFTER BLE startup (end of setup) -- it used to
   // sit here and BLE connect was unreliable. BLE comes up first now.
 
@@ -1410,6 +1451,61 @@ void setup() {
   currentState = 'I';
 }
 
+// ---------------- Rotary encoder -> speed -------------------------
+// The knob is the authoritative speed input: it applies immediately, pushes
+// the new value to the phone, and briefly blocks BLE "SPD" writes so the app
+// slider cannot stomp what you just dialled in.
+void applySpeedPercent(int pct) {
+  speedPercent = constrain(pct, 50, 100);
+  double span = 170.0 - 93.0;
+  double baseInterval = 170.0 - ((double)(speedPercent - 50) * span / 50.0);
+  baseTargetStepIntervalMicros = (unsigned long)lround(baseInterval);
+  applySpeedTarget();
+}
+
+void pollRotaryEncoder() {
+  if (!rotaryEncoder.encoderChanged()) return;
+  long v = rotaryEncoder.readEncoder();
+  long delta = v - lastEncoderValue;
+  lastEncoderValue = v;
+  if (delta == 0) return;
+
+  // one detent = 1 %; spinning fast makes delta jump (library acceleration),
+  // so scale the step but keep it inside +/-ENC_MAX_JUMP.
+  long ad = delta < 0 ? -delta : delta;
+  int inc = 1 + (int)(ad / 4);
+  if (inc > ENC_MAX_JUMP) inc = ENC_MAX_JUMP;
+  int newSpeed = constrain(speedPercent + (delta > 0 ? inc : -inc), 50, 100);
+  if (newSpeed == speedPercent) return;
+
+  applySpeedPercent(newSpeed);
+  lastEncoderMoveMs = millis();
+  encSpeedDirty = true;
+  encNotifyPending = true;
+}
+
+// Debounced flash write + BLE push (called from loop)
+void flushRotaryEncoder() {
+  unsigned long now = millis();
+  if (encNotifyPending && now - lastEncNotifyMs > 150) {
+    encNotifyPending = false;
+    lastEncNotifyMs = now;
+    sendStatus(true);
+  }
+  if (encSpeedDirty && now - lastEncoderMoveMs > ENC_NVS_SETTLE_MS) {
+    encSpeedDirty = false;
+    prefs.begin("respooler", false);
+    prefs.putUInt("speed", baseTargetStepIntervalMicros);
+    prefs.end();
+  }
+}
+
+// true while the knob outranks the phone: incoming BLE "SPD" is ignored
+bool encoderHasPriority() {
+  return lastEncoderMoveMs > 0 &&
+         (millis() - lastEncoderMoveMs < ENC_BLE_LOCKOUT_MS);
+}
+
 // ------------------- Main loop -----------------------------------
 // ---------------- OLED refresh (non-blocking, called from loop) ---------------
 void updateOled() {
@@ -1479,6 +1575,10 @@ void loop() {
     updateOled();
   }
   pollSerialCommands();
+
+  // rotary encoder: poll every loop (cheap) + debounced BLE/flash flush
+  pollRotaryEncoder();
+  flushRotaryEncoder();
 
   // (debug I2C probe removed -- root cause was SDA/SCL wired swapped)
 

@@ -48,6 +48,7 @@
 | 5 | 连接状态灯 | | 12/13 | TMC UART RX/TX（=板载D4/D5脚，DIO模式空闲） |
 | 6/7 | STEP/DIR | | 19 | 风扇 |
 | 8 | 舵机 | | 3 / 1 | **OLED SDA / SCL**（注意顺序！实物是 SDA→GPIO3、SCL→GPIO1） |
+| 0 | 编码器 A (CLK) | | 18 | 编码器 B (DT)（v1.3.0 新增） |
 
 ---
 
@@ -154,3 +155,98 @@ I2C 两线反过来 → 主机发什么从机都听不见 → 全总线 0 应答
 - 旺泓 0.96" 七脚模块出厂是 **4 线 SPI**，改 I2C 要动背面电阻（R3→R1、R8 短接）；**本项目最终用的是原生 4 脚 I2C 屏**
 - I2C 模式下 `RES→3.3V`、`DC→GND`（地址 0x3C）、`CS→GND` 三个脚必须接固定电平，**悬空 = 黑屏**
 - 正式固件现已在启动时运行时扫描地址（0x3C / 0x3D 自适应），不再硬编码
+
+---
+
+## 6. 旋转编码器调速（2026-10-19，固件 v1.3.0）
+
+### 需求
+
+用旋转编码器调速度（SPD 50–100），**快速旋转要能加速调整**，且**编码器优先级高于蓝牙**。
+库指定 `igorantolic/Ai Esp32 Rotary Encoder@^1.7`。
+参考工程：`D:\WorkPRJ\VscodePRJ\ESP32PRJ\12-28(已经实现spinbox位闪烁)\12-28\esp32_04_key ai encoder_modbus`
+（实际实现在 `lib/my_lvgl/src/my_key.cpp`，不在 main.cpp 里，找的时候别只搜 main）。
+
+### 参考工程的关键写法
+
+```cpp
+AiEsp32RotaryEncoder rotaryEncoder =
+    AiEsp32RotaryEncoder(A_PIN, B_PIN, SW_PIN, /*VCC*/-1, /*STEPS*/4);
+
+rotaryEncoder.begin();
+rotaryEncoder.setup(readEncoderISR);                 // ISR 里只调 readEncoder_ISR()
+rotaryEncoder.setBoundaries(-1000, 1000, true);      // true = 到边界回绕
+rotaryEncoder.setAcceleration(250);                  // 加速度
+
+void IRAM_ATTR readEncoderISR() { rotaryEncoder.readEncoder_ISR(); }
+
+// 主循环取值
+if (rotaryEncoder.encoderChanged()) {
+  long v = rotaryEncoder.readEncoder();
+  long delta = v - lastValue;
+  lastValue = v;
+}
+```
+
+- ⚠️ 参考工程里调了 `disableAcceleration()`（注释写着"默认已启用"）。**要"快转加速"就必须让它启用**，`setAcceleration(0)` 才是关闭。
+- 加速度原理（库源码）：相邻两次脉冲间隔 < 200 ms 时，`encoder0Pos += coef / 间隔ms`，所以**转得越快，单次 delta 越大**；慢转就是干净的 1 格 1 计数。
+
+### 本工程实现
+
+引脚（C3 只剩这两个空闲脚；18/19 是原生 USB D-/D+，本板串口走 CH343，所以 19 已给风扇、18 可用）：
+
+| 编码器 | GPIO | 宏 |
+|---|---|---|
+| CLK (A) | 0 | `ENC_A_PIN` |
+| DT (B) | 18 | `ENC_B_PIN` |
+| SW | 不接 | `ENC_SW_PIN -1` |
+
+可调宏（都在 `src/main.cpp` 顶部）：
+
+```cpp
+#define ENC_STEPS 4              // 转一格跳 2% 就改成 2
+#define ENC_ACCEL 90             // 0 = 关加速；越大猛转跳得越狠
+#define ENC_MAX_JUMP 10          // 单次事件最多 ±10%
+#define ENC_BLE_LOCKOUT_MS 2000  // 编码器优先时长
+#define ENC_NVS_SETTLE_MS 800    // 防抖写 flash
+```
+
+四个函数的分工：
+
+| 函数 | 职责 |
+|---|---|
+| `applySpeedPercent(pct)` | **唯一速度换算入口**：`间隔µs = 170 − (SPD−50) × 77 / 50`，再 `applySpeedTarget()`。BLE 的 `SPD` 命令也改成调它 |
+| `pollRotaryEncoder()` | 每 loop 调一次。`inc = 1 + |delta|/4`（上限 `ENC_MAX_JUMP`），慢转 1 格 = ±1%，快转自动放大 |
+| `flushRotaryEncoder()` | 变速后 150 ms 推一次 `sendStatus(true)` 给手机（节流）；手停 800 ms 后才写 NVS |
+| `encoderHasPriority()` | 编码器动过 2 秒内，BLE 的 `SPD` 直接忽略，串口打 `[BLE] SPD ignored (encoder has priority)` |
+
+设计取舍：
+- **NVS 必须防抖**：每转一格就 `prefs.putUInt()` 会疯狂磨损 flash，改成"静止 800 ms 才落盘"
+- **BLE 回传要节流**：notify 太频繁会挤占 BLE 栈，150 ms 一次足够让 App 滑条跟手
+- **优先级只锁 2 秒**：既能挡住 App 滑条回写旧值，又不至于让手机永久失控
+
+### 踩过的坑
+
+1. **前向声明**：`applySpeedPercent()` / `encoderHasPriority()` 定义在 loop 区（文件后部），但 BLE 命令处理在文件前部 → 编译报 `not declared`，必须在顶部前向声明区加两行。
+2. **`-1` 按键脚不是所有方法都安全**：库的 `setup()` / `begin()` 里有 `if (encoderButtonPin >= 0)` 保护，但 `isEncoderButtonDown()` / `isEncoderButtonClicked()` **没有**，不接按键时千万别调这两个。
+3. **又烧错环境**：工程里曾有 `[env:oled_diag]`（屏幕显示 `I2C OK!`），烧错后看起来像"主固件坏了"，白折腾。已把该 env 整段注释 + `[platformio] default_envs = esp32c3`，现在只有一个环境。
+4. **编译一次约 2 分钟**，改完代码交给用户自己编译，不要反复跑 pio。
+
+### 现场调试对照表
+
+| 现象 | 改法 |
+|---|---|
+| 顺时针速度变小（方向反） | `ENC_A_PIN` / `ENC_B_PIN` 对调 |
+| 转一格跳 2% | `ENC_STEPS` 4 → 2 |
+| 猛转跳太猛 / 太肉 | `ENC_ACCEL` 调小 / 调大 |
+| 手机一拖滑条就把编码器值顶掉 | `ENC_BLE_LOCKOUT_MS` 加大 |
+| 变速后手机界面不动 | 检查 `sendStatus(true)` 是否被 `!deviceConnected` 挡掉 |
+
+### 验证方法
+
+```
+[BOOT] 2c rotary encoder ok      ← 编码器初始化成功
+```
+
+转编码器 → OLED 上 `SPD xx%` 立刻变、电机转速跟着变、手机滑条同步；
+2 秒内用手机发 `SPD` 应看到 `[BLE] SPD ignored (encoder has priority)`。
